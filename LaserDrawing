@@ -1,0 +1,302 @@
+// Copyright (c) 2024 by Richard Lee (Shards632). Licensed under CC BY-NC v4.0 (https://creativecommons.org/licenses/by-nc/4.0/)
+
+import LocalCamera, { CameraTransitionOptions, Easing } from "horizon/camera";
+import { Component, PropTypes, CodeBlockEvents, Player, PlayerDeviceType, GrabbableEntity, PlayerControls, ButtonIcon, PlayerInputAction, EventSubscription, PlayerInput, World, ParticleGizmo, InteractionInfo, Vec3, RaycastGizmo, RaycastHit } from "horizon/core";
+
+const TRANSITION_DURATION_SECONDS = 0.5
+const CAMERA_TRANSITION_OPTIONS: CameraTransitionOptions = {
+    duration: TRANSITION_DURATION_SECONDS,
+    easing: Easing.EaseInOut,
+}
+
+class Pen extends Component<typeof Pen> {
+    static readonly propsDefinition = {
+        laserBeam: { type: PropTypes.Entity, },
+        trailFX: { type: PropTypes.Entity, },
+        raycast: { type: PropTypes.Entity, },
+    }
+
+    private readonly buryDepth = -0.1
+    private readonly raiseHeight = 0.01
+    private drawRestart = false
+    private lastNormal = Vec3.zero
+    private lastHit = Vec3.zero
+    private drawing = false
+
+    // XS input listeners
+    aimInput?: PlayerInput
+    eraseInput?: PlayerInput
+    returnInput?: PlayerInput
+    focusedInteractionSubscriptions: EventSubscription[] = []
+
+    override preStart() {
+        this.connectCodeBlockEvent(this.entity, CodeBlockEvents.OnGrabStart, this.onGrabStart.bind(this))
+        this.connectCodeBlockEvent(this.entity, CodeBlockEvents.OnGrabEnd, this.onGrabEnd.bind(this))
+    }
+
+    override start() {
+        if (!this.props.laserBeam || !this.props.trailFX || !this.props.raycast) {
+            console.error('Missing required entities');
+            throw new Error('Missing required entities');
+        }
+        this.props.laserBeam.visible.set(false)
+    }
+
+    onGrabStart(isRight: boolean, player: Player) {
+        switch (player.deviceType.get()) {
+            case PlayerDeviceType.VR:
+                // VR players get a laser beam to aim
+                this.props.laserBeam!.visible.set(true);
+                this.props.laserBeam!.owner.set(player);
+                // use legacy trigger down/up events
+                this.connectCodeBlockEvent(this.entity, CodeBlockEvents.OnIndexTriggerDown, this.onIndexTriggerDown.bind(this))
+                this.connectCodeBlockEvent(this.entity, CodeBlockEvents.OnIndexTriggerUp, this.onIndexTriggerUp.bind(this))
+                // use legacy button2 down event
+                this.connectCodeBlockEvent(this.entity, CodeBlockEvents.OnButton2Down, this.onButton2Down.bind(this))
+                // update beam and raycast every frame
+                this.connectLocalBroadcastEvent(World.onUpdate, this.onBeamDraw.bind(this));
+                break;
+            case PlayerDeviceType.Mobile:
+            case PlayerDeviceType.Desktop:
+                // XS players don't use laser beam, instead use an onscreen button to go into 
+                // focused interaction to draw
+                this.connectAimInput(isRight);
+                this.connectEraseInput(isRight);
+                break;
+            default:
+                console.error('Unsupported device type');
+                throw new Error('Unsupported device type');
+        }
+        this.props.trailFX!.owner.set(player);
+        this.props.raycast!.owner.set(player);
+    }
+
+    onGrabEnd(player: Player) {
+        this.stopDrawing();
+        this.props.laserBeam!.visible.set(false);
+        // ownership change will cause all listeners to be unregistered
+        this.entity.owner.set(this.world.getServerPlayer());
+    }
+
+    //////////
+    //
+    // XS interaction listeners
+    //
+    //////////
+
+    connectAimInput(isRight: boolean) {
+        this.aimInput = PlayerControls.connectLocalInput(
+            isRight ? PlayerInputAction.RightTrigger : PlayerInputAction.LeftTrigger,
+            ButtonIcon.Aim,
+            this)
+        this.aimInput.registerCallback((action, pressed) => {
+            if (pressed) {
+                this.onAim(isRight);
+            }
+        })
+    }
+
+    connectEraseInput(isRight: boolean) {
+        this.eraseInput = PlayerControls.connectLocalInput(
+            isRight ? PlayerInputAction.RightSecondary : PlayerInputAction.LeftSecondary,
+            ButtonIcon.Swap,
+            this)
+        this.eraseInput.registerCallback((action, pressed) => {
+            if (pressed) {
+                this.onErase(isRight);
+            }
+        })
+    }
+
+    connectReturnInput(isRight: boolean) {
+        this.returnInput = PlayerControls.connectLocalInput(
+            isRight ? PlayerInputAction.RightPrimary : PlayerInputAction.LeftPrimary,
+            ButtonIcon.Drop,
+            this)
+        this.returnInput.registerCallback((action, pressed) => {
+            if (pressed) {
+                this.onReturn(isRight);
+            }
+        })
+    }
+
+    onAim(isRight: boolean) {
+        // no longer need aim input
+        this.aimInput?.disconnect()
+        // switch to first person for better aiming w/o avatar in the way
+        LocalCamera.setCameraModeFirstPerson(CAMERA_TRANSITION_OPTIONS)
+        this.async.setTimeout(() => {
+            // wait until camera animation is complete before switching to focused interaction mode
+            this.world.getLocalPlayer().enterFocusedInteractionMode()
+            // Probably could just do these at world start if local player, and not register/unregister every time they go in/out of aim mode.
+            this.focusedInteractionSubscriptions.push(
+                this.connectLocalBroadcastEvent(PlayerControls.onFocusedInteractionInputStarted, ({ interactionInfo }) => this.onStartDraw(interactionInfo)),
+                this.connectLocalBroadcastEvent(PlayerControls.onFocusedInteractionInputMoved, ({ interactionInfo }) => this.onDrag(interactionInfo)),
+                this.connectLocalBroadcastEvent(PlayerControls.onFocusedInteractionInputEnded, ({ interactionInfo }) => this.onEndDraw(interactionInfo)),
+                this.connectCodeBlockEvent(this.entity, CodeBlockEvents.OnPlayerExitedFocusedInteraction, (player) => {
+                    if (player === this.world.getLocalPlayer()) {
+                        // current player has forcibly exited focused interaction mode
+                        this.onReturn(isRight)
+                    }
+                }),
+            )
+            this.connectReturnInput(isRight)
+        }, TRANSITION_DURATION_SECONDS * 1000) 
+    }
+
+    onReturn(isRight: boolean) {
+        // no longer need return input
+        this.returnInput?.disconnect()
+        // return to third person so you can see your avatar again
+        LocalCamera.setCameraModeThirdPerson(CAMERA_TRANSITION_OPTIONS)
+        // immediately leave focused interaction mode
+        this.world.getLocalPlayer().exitFocusedInteractionMode()
+        // remove all focused interaction event subscriptions
+        this.focusedInteractionSubscriptions.forEach(sub => sub.disconnect())
+        this.focusedInteractionSubscriptions.length = 0
+        this.stopDrawing()
+        this.async.setTimeout(() => {
+            // wait until camera animation is complete before re-enabling aim button
+            this.connectAimInput(isRight)
+        }, TRANSITION_DURATION_SECONDS * 1000)
+    }
+
+    onErase(isRight: boolean) {
+        this.eraseTrail()
+    }
+
+    // XS focused interaction press
+    onStartDraw(info: InteractionInfo[]) {
+        this.startDrawing()
+    }
+
+    // XS focused interaction move
+    onDrag(info: InteractionInfo[]) {
+        const raycastResult = this.props.raycast!.as(RaycastGizmo).raycast(
+            info[0].worldRayOrigin,
+            info[0].worldRayDirection
+        )
+        this.draw(raycastResult)
+    }
+
+    // XS focused interaction release
+    onEndDraw(info: InteractionInfo[]) {
+        this.stopDrawing()
+    }
+
+    //////////
+    //
+    // VR event listeners
+    //
+    //////////
+
+    onIndexTriggerDown(player: Player) {
+        this.startDrawing()
+    }
+
+    onIndexTriggerUp(player: Player) {
+        this.stopDrawing()
+    }
+
+    onButton2Down(player: Player) {
+        this.eraseTrail()
+    }
+
+    onBeamDraw() {
+        const raycastResult = this.props.raycast!.as(RaycastGizmo).raycast(
+            this.props.raycast!.position.get(),
+            this.props.raycast!.forward.get()
+        )
+        // process raycast result and draw trail, if needed
+        const hitPoint = this.draw(raycastResult)
+        // after draw() has updated hitPoint, update beam position and scale
+        // center the beam between pointer and hit point
+        this.props.laserBeam!.position.set(
+            Vec3.lerp(this.props.raycast!.position.get(), hitPoint, 0.5)
+        )
+        // rotate the beam to match the raycast orientation
+        // (relies on beam having +Z forward and +Y up)
+        this.props.laserBeam!.rotation.set(
+            this.props.raycast!.rotation.get()
+        )
+        // stretch beam between raycast and hit point
+        // (assumes beam scale reflect actual size)
+        this.props.laserBeam!.scale.set(
+            new Vec3(
+                0.005,
+                0.005,
+                this.props.raycast!.position.get().distance(hitPoint)
+            )
+        )
+    }
+
+    //////////
+    //
+    // Common Code
+    //
+    //////////
+    
+    startDrawing() {
+        this.drawing = true
+        this.drawRestart = true
+    }
+
+    stopDrawing() {
+        this.drawing = false
+        // bury trail at last good hit position
+        this.props.trailFX!.position.set(
+            this.lastHit.add(this.lastNormal.mul(this.buryDepth))
+        )
+    }
+
+    eraseTrail() {
+        // clear trail
+        this.props.trailFX!.as(ParticleGizmo)?.stop()
+        this.async.setTimeout(() => {
+            // wait a short time before restarting trail to ensure
+            // stop is broadcast to all other clients
+            this.props.trailFX!.as(ParticleGizmo)?.play()
+        }, 50)
+    }
+
+    draw(raycastResult: RaycastHit | null) {
+        let hitPoint: Vec3
+        if (raycastResult) {
+            hitPoint = raycastResult.hitPoint
+            // save last good hits in case next frame misses / stops drawing
+            this.lastHit = hitPoint
+            this.lastNormal = raycastResult.normal
+            if (this.drawing) {
+                if (this.drawRestart) {
+                    // reposition trail under new hit position, don't start draw this frame to minimize "smearing"
+                    this.props.trailFX!.position.set(
+                        hitPoint.add(this.lastNormal.mul(this.buryDepth))
+                    )
+                    this.drawRestart = false
+                } else {
+                    // lift trail for better visibility
+                    this.props.trailFX!.position.set(
+                        hitPoint.add(this.lastNormal.mul(this.raiseHeight))
+                    )
+                }
+            }
+        } else {
+            // missed all geometry
+            if (this.drawing && !this.drawRestart) {
+                // bury trail at last good hit position
+                this.props.trailFX!.position.set(
+                    this.lastHit.add(this.lastNormal.mul(this.buryDepth))
+                )
+                // start drawing again on next hit
+                this.drawRestart = true
+            }
+            // cast off into the far distance for VR beam drawing
+            hitPoint = this.props.raycast!.position.get().add(
+                this.props.raycast!.forward.get().mul(1000)
+            )
+        }
+        return hitPoint
+    }
+}
+
+Component.register(Pen)
